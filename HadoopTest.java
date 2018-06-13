@@ -8,24 +8,28 @@ package hadooptest;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.StringTokenizer;
+import java.util.TreeMap;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.DoubleWritable;
 import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableComparable;
 import org.apache.hadoop.io.WritableComparator;
-import org.apache.hadoop.mapred.TextInputFormat;
+import org.apache.hadoop.mapred.jobcontrol.JobControl;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.hadoop.mapreduce.Partitioner;
-
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
 
 
 
@@ -34,11 +38,10 @@ import org.apache.hadoop.util.GenericOptionsParser;
  * @author David
  */
 
-public class HadoopTest {
+public class HadoopTest extends Configured implements Tool{
 
      static class MapFilter extends Mapper<LongWritable, Text, CompositeKey, DoubleWritable> {
       
-        //private Text word = new Text();
         private String result_filter = "solved";
        
         @Override
@@ -55,16 +58,118 @@ public class HadoopTest {
             }
         }
     }
-
+     
+    ////////Write the pair values Solver - Time sorted ascendand
     static class ReducerSorter extends Reducer<CompositeKey, DoubleWritable, Text, DoubleWritable> {
         @Override
-        protected void reduce(CompositeKey key, Iterable<DoubleWritable> values, Context context) throws IOException, InterruptedException {
-            
+        protected void reduce(CompositeKey key, Iterable<DoubleWritable> values, Context context) throws IOException, InterruptedException {          
             
             for (DoubleWritable value : values) {
                 context.write(key.key, value);
             }          
         }     
+    }
+    
+    
+    /////////Convert the Solver - Times in  single row
+
+    public static class SingleRowMapper extends Mapper <LongWritable, Text, LongWritable, Text>{
+        @Override
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            long column =0;
+            long row = key.get();
+            String[] Values = value.toString().split(" ");
+            for(String SValue : Values){
+                context.write(new LongWritable(column), new Text(row + "\t" + SValue));
+                ++column;
+            }
+        }
+    }
+    
+    ////////Write the Singles Rows
+    public static class SingleRowReducer extends Reducer<LongWritable, Text, Text, NullWritable>{
+        @Override
+        public void reduce(LongWritable key, Iterable<Text> values, Context context)throws IOException, InterruptedException {          
+            TreeMap<Long, String> SingleRow = new TreeMap<Long, String>();
+             
+
+            while (values.iterator().hasNext()) {
+                String rowValue = values.iterator().next().toString();
+                String[] rowSplits = rowValue.split("\t");
+
+                SingleRow.put(Long.valueOf(rowSplits[0]), rowSplits[1]);
+            }
+
+            String rowString = StringUtils.join("\t", SingleRow.values());
+            context.write(new Text(rowString), NullWritable.get());
+            
+            /*for (Text value : values) {
+                context.write(value, NullWritable.get());
+            } */ 
+        }
+    }
+    
+    
+    
+    public int run(String[] args) throws Exception {
+        JobControl jobControl  = new JobControl("jobChain");
+        Configuration conf1 = getConf();
+        
+        
+        Job job1 = Job.getInstance(conf1);
+        job1.setJarByClass(HadoopTest.class);
+        job1.setJobName("Filter and Sort");
+        
+        FileInputFormat.setInputPaths(job1, new Path(args[0]));
+        FileOutputFormat.setOutputPath(job1, new Path(args[1] + "/temp"));
+        
+        job1.setMapperClass(MapFilter.class);
+        job1.setReducerClass(ReducerSorter.class);               
+        job1.setGroupingComparatorClass(KeyComparator.class);
+        
+        job1.setOutputKeyClass(CompositeKey.class);
+        job1.setOutputValueClass(DoubleWritable.class); 
+        
+        ControlledJob controlledJob1  = new ControlledJob(conf1);
+        controlledJob1.setJob(job1);
+        
+        jobControl.addJob(controlledJob1);
+        Configuration conf2 = getConf();
+        
+        Job job2 = Job.getInstance(conf2);
+        job2.setJarByClass(HadoopTest.class);
+        job2.setJobName("Create Single Row");
+        
+        FileInputFormat.setInputPaths(job2, new Path(args[1] + "/temp"));
+        FileOutputFormat.setOutputPath(job2, new Path(args[1] + "/final"));
+        
+        job2.setMapperClass(SingleRowMapper.class);
+        job2.setReducerClass(SingleRowReducer.class);
+        
+        job2.setOutputKeyClass(LongWritable.class);
+        job2.setOutputValueClass(Text.class);
+        
+        ControlledJob controlledJob2 = new ControlledJob(conf2);
+        controlledJob2.setJob(job2);
+        
+        controlledJob2.addDependingJob(controlledJob1); 
+        jobControl.addJob(controlledJob2);
+        Thread jobControlThread = new Thread(jobControl);
+        jobControlThread.start();
+        
+        while (!jobControl.allFinished()) {
+            System.out.println("Jobs in waiting state: " + jobControl.getWaitingJobList().size());  
+            System.out.println("Jobs in ready state: " + jobControl.getReadyJobsList().size());
+            System.out.println("Jobs in running state: " + jobControl.getRunningJobList().size());
+            System.out.println("Jobs in success state: " + jobControl.getSuccessfulJobList().size());
+            System.out.println("Jobs in failed state: " + jobControl.getFailedJobList().size());
+            try {
+                Thread.sleep(5000);
+            } catch (Exception e) {
+            }
+        } 
+        System.exit(0);  
+        return (job1.waitForCompletion(true) ? 0 : 1);   
     }
 
     /**
@@ -72,27 +177,12 @@ public class HadoopTest {
      */
     public static void main(String[] args) throws Exception {
         // TODO code application logic here
-        Configuration conf = new Configuration();
-        Job job = Job.getInstance(conf, "WordCount");
-        String[] myArgs = new GenericOptionsParser(conf, args).getRemainingArgs();
-
-        job.setMapperClass(MapFilter.class);       
-        job.setReducerClass(ReducerSorter.class);
-        
-        
-        job.setOutputKeyClass(CompositeKey.class);
-        job.setOutputValueClass(DoubleWritable.class);
-        job.setNumReduceTasks(1);
-        job.setGroupingComparatorClass(KeyComparator.class);
-        
-        FileInputFormat.setInputPaths(job, new Path(myArgs[0]));
-        FileOutputFormat.setOutputPath(job, new Path(myArgs[1]));
-
-        job.waitForCompletion(true);
-        System.exit(0);
+        int exitCode = ToolRunner.run(new HadoopTest(), args);  
+         System.exit(exitCode);
 
     }
     
+    ///////// Secondary Sort Classes
     public static class CompositeKey implements Writable, WritableComparable<CompositeKey> {
 
         private Text key;
@@ -147,9 +237,7 @@ public class HadoopTest {
         public int hashCode() {
             return key.hashCode();
         }
-    }
-
-    
+    }    
     static class KeyComparator extends WritableComparator {
  
       public KeyComparator() {
@@ -163,7 +251,10 @@ public class HadoopTest {
          CompositeKey pair2 = (CompositeKey) wc2;
          return pair.key.compareTo(pair2.key);
      }
-   }   
+   }  
+    
+    
+    ////hadoop jar D:\Estudio\Big_Data\Codigo\HadoopTest\dist\HadoopTest.jar D:\Estudio\Big_Data\input D:\Estudio\Big_Data\output
  }
     
 
